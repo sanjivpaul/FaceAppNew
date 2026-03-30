@@ -331,6 +331,8 @@ function AppContent() {
   const reconnectIntervalRef = useRef<ReturnType<typeof setInterval> | null>(
     null,
   );
+  const startFrameStreamingRef = useRef<() => void>(() => {});
+  const stopFrameStreamingRef = useRef<() => void>(() => {});
   const isSendingRef = useRef(false); // Flag to control frame sending
   const sendCountRef = useRef(0); // Track sent frames
 
@@ -416,25 +418,34 @@ function AppContent() {
     void requestLocationPermission();
   }, [siteLocationPassed, requestLocationPermission]);
 
-  // Keep camera preview visible after the site gate passes.
-  // (We still only stream frames when `isScanning` is true.)
-  useEffect(() => {
-    if (siteLocationPassed && hasPermission && device && isAppForeground) {
-      setIsCameraActive(true);
-    }
-  }, [siteLocationPassed, hasPermission, device, isAppForeground]);
-
   // Ensure the camera preview reliably returns after background/foreground transitions.
   useEffect(() => {
     const sub = AppState.addEventListener('change', nextState => {
       setAppStateStatus(nextState);
-      if (nextState === 'active' || nextState === 'unknown') {
-        // Remount the Camera to recover preview on some devices.
-        setCameraInstanceKey(k => k + 1);
+      const goingForeground = nextState === 'active' || nextState === 'unknown';
+
+      if (!goingForeground) {
+        // Best practice: fully stop camera work in background.
+        stopFrameStreamingRef.current();
+        setIsCameraActive(false);
+        return;
+      }
+
+      // Remount the Camera to recover preview on some devices.
+      setCameraInstanceKey(k => k + 1);
+
+      // Only re-activate camera if the user is currently scanning.
+      if (isScanning) {
+        setIsCameraActive(true);
+        setTimeout(() => {
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            startFrameStreamingRef.current();
+          }
+        }, 600);
       }
     });
     return () => sub.remove();
-  }, []);
+  }, [isScanning]);
 
   const handleCheckLocationForAttendance = useCallback(async () => {
     setSiteCheckError(null);
@@ -832,6 +843,7 @@ function AppContent() {
           setTimeout(() => {
             setIsScanning(false);
             setAnnotatedImage(null);
+            setIsCameraActive(false);
             setTimeout(() => {
               setStatus('idle');
               setStatusMessage('Ready to scan');
@@ -859,6 +871,7 @@ function AppContent() {
           setTimeout(() => {
             setIsScanning(false);
             setAnnotatedImage(null);
+            setIsCameraActive(false);
             setTimeout(() => {
               setStatus('idle');
               setStatusMessage('Ready to scan');
@@ -878,6 +891,7 @@ function AppContent() {
           setTimeout(() => {
             setIsScanning(false);
             setAnnotatedImage(null);
+            setIsCameraActive(false);
             setTimeout(() => {
               setStatus('idle');
               setStatusMessage('Ready to scan');
@@ -1062,6 +1076,10 @@ function AppContent() {
     }, FRAME_INTERVAL);
   }, [captureAndSendFrame]);
 
+  useEffect(() => {
+    startFrameStreamingRef.current = startFrameStreaming;
+  }, [startFrameStreaming]);
+
   // Stop frame streaming
   const stopFrameStreaming = useCallback(() => {
     isSendingRef.current = false;
@@ -1071,6 +1089,10 @@ function AppContent() {
     }
     console.log('⏹️ Frame streaming stopped');
   }, []);
+
+  useEffect(() => {
+    stopFrameStreamingRef.current = stopFrameStreaming;
+  }, [stopFrameStreaming]);
 
   // Start scanning - Activate camera first, then stream
   const startScanning = useCallback(async () => {
@@ -1128,6 +1150,7 @@ function AppContent() {
     stopFrameStreaming();
     setIsScanning(false);
     setAnnotatedImage(null);
+    setIsCameraActive(false);
 
     // Reset status
     setTimeout(() => {
@@ -1334,7 +1357,7 @@ function AppContent() {
                 ref={cameraRef}
                 style={StyleSheet.absoluteFill}
                 device={device}
-                isActive={isAppForeground}
+                isActive={isCameraActive && isAppForeground}
                 photo={true}
                 video={true}
               />
