@@ -13,7 +13,6 @@
       android:allowBackup="false"
       android:theme="@style/AppTheme"
       android:usesCleartextTraffic="${usesCleartextTraffic}"
-       android:hardwareAccelerated="true"
       android:supportsRtl="true">
       <activity
         android:name=".MainActivity"
@@ -26,7 +25,6 @@
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent-filter>
-        <uses-feature android:name="android.hardware.camera" />
       </activity>
     </application>
 </manifest>
