@@ -4,12 +4,16 @@ import {
   Animated,
   Dimensions,
   Easing,
+  FlatList,
+  Linking,
   Modal,
   Platform,
+  PermissionsAndroid,
   SafeAreaView,
   StatusBar,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
@@ -24,8 +28,43 @@ import ImageResizer from '@bam.tech/react-native-image-resizer';
 
 const WS_URL = 'wss://ams.braincraft.in/api/v1/ws/attendance';
 const SITES_API = 'https://ams.braincraft.in/api/v1/sites';
+const EMP_MONTHLY_ATTENDANCE_API =
+  'https://ams.braincraft.in/api/v1/attendance/emp-monthly-attendance';
 
-const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
+const YEAR_OPTIONS: string[] = (() => {
+  const y = new Date().getFullYear();
+  const list: string[] = [];
+  for (let i = y - 10; i <= y + 3; i += 1) {
+    list.push(String(i));
+  }
+  return list;
+})();
+
+/** Calendar day of month, 01–31 (local time). */
+function formatAttendanceDay(value: string): string {
+  const trimmed = (value ?? '').trim();
+  if (!trimmed) return '—';
+  const parsed = Date.parse(trimmed);
+  if (!Number.isNaN(parsed)) {
+    const d = new Date(trimmed);
+    return String(d.getDate()).padStart(2, '0');
+  }
+  const m = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return m[3];
+  return trimmed;
+}
+
+/** HH:mm in local timezone from ISO string. */
+function formatAttendanceTime(iso: string | null | undefined): string {
+  if (iso == null || String(iso).trim() === '') return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
+  const h = d.getHours();
+  const mi = d.getMinutes();
+  return `${String(h).padStart(2, '0')}:${String(mi).padStart(2, '0')}`;
+}
+
+const { width: SCREEN_W } = Dimensions.get('window');
 const CARD_MAX_W = 420;
 const ACCENT = '#2EF2A1';
 const BG = '#070A10';
@@ -37,7 +76,16 @@ type AlertButton = {
   onPress?: () => void;
 };
 
+type AttendanceRow = {
+  date: string;
+  punchInTime: string;
+  punchOutTime: string;
+  ot: string;
+  absent: boolean;
+};
+
 export default function App() {
+  const [tab, setTab] = useState<'mark' | 'check'>('mark');
   const [screen, setScreen] = useState<'location' | 'attendance'>('location');
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState('');
@@ -75,11 +123,185 @@ export default function App() {
 
   const dismissAlert = () => setAlertVisible(false);
 
+  const showError = (title: string, message?: string) =>
+    showAlert({
+      title,
+      message,
+      buttons: [{ text: 'OK', variant: 'primary' }],
+    });
+
+  const requestAndroidLocationPermission = async (): Promise<boolean> => {
+    if (Platform.OS !== 'android') return true;
+
+    try {
+      const results = await PermissionsAndroid.requestMultiple([
+        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+        PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION,
+      ]);
+
+      const fine = results[PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION];
+      const coarse =
+        results[PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION];
+
+      const granted =
+        fine === PermissionsAndroid.RESULTS.GRANTED ||
+        coarse === PermissionsAndroid.RESULTS.GRANTED;
+
+      if (!granted) {
+        showAlert({
+          title: 'Location permission',
+          message:
+            'Location access is required to verify you’re on-site. Please allow it in Settings.',
+          buttons: [
+            {
+              text: 'Open settings',
+              variant: 'primary',
+              onPress: () => {
+                Linking.openSettings().catch(() => {});
+              },
+            },
+            { text: 'Cancel', variant: 'secondary' },
+          ],
+        });
+      }
+
+      return granted;
+    } catch {
+      showAlert({
+        title: 'Location permission',
+        message:
+          'Could not request location permission. Please allow it in Settings.',
+        buttons: [
+          {
+            text: 'Open settings',
+            variant: 'primary',
+            onPress: () => {
+              Linking.openSettings().catch(() => {});
+            },
+          },
+          { text: 'Cancel', variant: 'secondary' },
+        ],
+      });
+      return false;
+    }
+  };
+
   const scanBox = useMemo(() => {
     const w = Math.min(320, Math.max(260, Math.round(SCREEN_W * 0.72)));
     const h = Math.round(w * 1.18);
     return { w, h };
   }, []);
+
+  const [empId, setEmpId] = useState('');
+  const [month, setMonth] = useState('');
+  const [year, setYear] = useState(() => String(new Date().getFullYear()));
+  const [yearPickerVisible, setYearPickerVisible] = useState(false);
+  const [checkLoading, setCheckLoading] = useState(false);
+  const [rows, setRows] = useState<AttendanceRow[]>([]);
+
+  const normalizeAttendanceRows = (payload: any): AttendanceRow[] => {
+    const list: any[] = Array.isArray(payload)
+      ? payload
+      : Array.isArray(payload?.data)
+      ? payload.data
+      : Array.isArray(payload?.items)
+      ? payload.items
+      : Array.isArray(payload?.records)
+      ? payload.records
+      : Array.isArray(payload?.attendance)
+      ? payload.attendance
+      : [];
+
+    return list
+      .map((r: any) => {
+        const rawDate = String(
+          r?.date ??
+            r?.attendanceDate ??
+            r?.attendance_day ??
+            r?.day ??
+            r?.punchDate ??
+            r?.workDate ??
+            '',
+        ).trim();
+        const date = formatAttendanceDay(rawDate);
+
+        const checkInRaw = r?.checkIn ?? r?.check_in ?? r?.punchInTime ?? r?.inTime ?? r?.punchIn ?? r?.in;
+        const checkOutRaw =
+          r?.checkOut ?? r?.check_out ?? r?.punchOutTime ?? r?.outTime ?? r?.punchOut ?? r?.out;
+
+        const punchInTime = formatAttendanceTime(
+          typeof checkInRaw === 'string' ? checkInRaw : checkInRaw != null ? String(checkInRaw) : undefined,
+        );
+        const punchOutTime = formatAttendanceTime(
+          typeof checkOutRaw === 'string'
+            ? checkOutRaw
+            : checkOutRaw != null
+              ? String(checkOutRaw)
+              : undefined,
+        );
+
+        const ot =
+          String(r?.ot ?? r?.overtime ?? r?.overTime ?? r?.OT ?? '').trim() ||
+          '—';
+        const statusStr = String(r?.status ?? '').toUpperCase();
+        const absentRaw = r?.absent ?? r?.isAbsent ?? r?.status;
+        const absent =
+          typeof absentRaw === 'boolean'
+            ? absentRaw
+            : statusStr.includes('ABSENT') ||
+              String(absentRaw ?? '')
+                .toLowerCase()
+                .includes('absent');
+
+        return { date, punchInTime, punchOutTime, ot, absent } as AttendanceRow;
+      })
+      .filter(r => r.date !== '—');
+  };
+
+  const searchAttendance = async () => {
+    const emp = empId.trim();
+    const m = month.trim();
+    const y = year.trim();
+
+    if (!emp || !m || !y) {
+      showError('Missing fields', 'Please enter Employee ID and month.');
+      return;
+    }
+    if (!/^\d{1,2}$/.test(m) || Number(m) < 1 || Number(m) > 12) {
+      showError('Invalid month', 'Month must be between 1 and 12.');
+      return;
+    }
+
+    setCheckLoading(true);
+    setRows([]);
+    try {
+      const url = `${EMP_MONTHLY_ATTENDANCE_API}?month=${encodeURIComponent(
+        m,
+      )}&year=${encodeURIComponent(y)}&employeeId=${encodeURIComponent(emp)}`;
+
+      const res = await fetch(url);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const json = await res.json();
+      const normalized = normalizeAttendanceRows(json);
+      setRows(normalized);
+      if (normalized.length === 0) {
+        showAlert({
+          title: 'No records',
+          message: 'No attendance found for the selected month.',
+          buttons: [{ text: 'OK', variant: 'primary' }],
+        });
+      }
+    } catch (e: any) {
+      showError(
+        'Search failed',
+        `Could not fetch attendance. ${e?.message ?? ''}`.trim(),
+      );
+    } finally {
+      setCheckLoading(false);
+    }
+  };
 
   const stopScan = () => {
     if (intervalRef.current) {
@@ -111,6 +333,12 @@ export default function App() {
 
     try {
       // ✅ 1. Permission — iOS + Android
+      const ok = await requestAndroidLocationPermission();
+      if (!ok) {
+        setStatus('❌ Location permission denied');
+        setLoading(false);
+        return;
+      }
 
       // ✅ 2. Get GPS position
       Geolocation.getCurrentPosition(
@@ -291,7 +519,11 @@ export default function App() {
           message: 'We couldn’t match your face. Please try again.',
           buttons: [
             { text: 'Try again', variant: 'primary' },
-            { text: 'Back', variant: 'secondary', onPress: () => setScreen('location') },
+            {
+              text: 'Back',
+              variant: 'secondary',
+              onPress: () => setScreen('location'),
+            },
           ],
         });
       }
@@ -361,292 +593,465 @@ export default function App() {
 
   // ================= UI =================
 
-  // ---------- LOCATION SCREEN ----------
-  if (screen === 'location') {
+  const renderAlertModal = () => (
+    <Modal
+      visible={alertVisible}
+      transparent
+      animationType="fade"
+      onRequestClose={dismissAlert}
+    >
+      <View style={styles.alertBackdrop}>
+        <View style={styles.alertCard}>
+          <View style={styles.alertAccent} />
+          <Text style={styles.alertTitle}>{alertTitle}</Text>
+          {!!alertMessage && (
+            <Text style={styles.alertMessage}>{alertMessage}</Text>
+          )}
+
+          <View style={styles.alertBtnRow}>
+            {alertButtons.map((b, idx) => {
+              const variant = b.variant ?? 'primary';
+              const btnStyle =
+                variant === 'primary'
+                  ? styles.alertBtnPrimary
+                  : variant === 'danger'
+                  ? styles.alertBtnDanger
+                  : styles.alertBtnSecondary;
+              const textStyle =
+                variant === 'primary'
+                  ? styles.alertBtnPrimaryText
+                  : styles.alertBtnSecondaryText;
+
+              return (
+                <TouchableOpacity
+                  key={`${b.text}-${idx}`}
+                  style={[styles.alertBtnBase, btnStyle]}
+                  activeOpacity={0.9}
+                  onPress={() => {
+                    dismissAlert();
+                    b.onPress?.();
+                  }}
+                >
+                  <Text style={textStyle}>{b.text}</Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+
+  const MarkAttendanceTab = () => {
+    if (screen === 'location') {
+      return (
+        <SafeAreaView style={styles.safe}>
+          <StatusBar barStyle="light-content" />
+          <View style={styles.bg} />
+
+          <View style={styles.page}>
+            <View style={styles.header}>
+              <Text style={styles.kicker}>ORBINGER</Text>
+              <Text style={styles.h1}>Mark Attendance</Text>
+              <Text style={styles.sub}>
+                Verify location, then complete a face scan.
+              </Text>
+            </View>
+
+            <View style={styles.card}>
+              <View style={styles.rowBetween}>
+                <View>
+                  <Text style={styles.cardTitle}>Step 1</Text>
+                  <Text style={styles.cardBody}>
+                    Verify GPS location within the allowed radius.
+                  </Text>
+                </View>
+                <View style={styles.pill}>
+                  <Text style={styles.pillText}>50m</Text>
+                </View>
+              </View>
+
+              <TouchableOpacity
+                style={[styles.primaryBtn, loading && styles.btnDisabled]}
+                onPress={checkLocation}
+                disabled={loading}
+                activeOpacity={0.9}
+              >
+                {loading ? (
+                  <View style={styles.btnRow}>
+                    <ActivityIndicator color="#00130A" />
+                    <Text style={styles.primaryBtnText}>Checking…</Text>
+                  </View>
+                ) : (
+                  <Text style={styles.primaryBtnText}>Check Location</Text>
+                )}
+              </TouchableOpacity>
+
+              {!!status && (
+                <View style={styles.statusWrap}>
+                  <Text style={styles.statusText}>{status}</Text>
+                </View>
+              )}
+            </View>
+
+            <View style={styles.footer}>
+              <Text style={styles.footerText}>
+                Tip: Enable GPS and set Location Accuracy to High for faster
+                verification.
+              </Text>
+            </View>
+          </View>
+        </SafeAreaView>
+      );
+    }
+
+    return (
+      <View style={styles.attendanceRoot}>
+        <StatusBar
+          barStyle="light-content"
+          translucent
+          backgroundColor="transparent"
+        />
+
+        {device && (
+          <Camera
+            ref={cameraRef}
+            style={styles.camera}
+            device={device}
+            isActive={true}
+            photo={true}
+            preview={true}
+          />
+        )}
+
+        <View style={styles.cameraTint} />
+
+        <SafeAreaView style={styles.attendanceSafe}>
+          <View style={styles.topBar}>
+            <TouchableOpacity
+              style={styles.iconBtn}
+              onPress={() => {
+                stopScan();
+                setScreen('location');
+              }}
+              activeOpacity={0.8}
+            >
+              <Text style={styles.iconBtnText}>Back</Text>
+            </TouchableOpacity>
+
+            <View>
+              <Text style={styles.topTitle}>Face Scan</Text>
+              <Text style={styles.topSubtitle}>
+                Align your face inside the frame
+              </Text>
+            </View>
+
+            <View style={styles.iconBtnGhost} />
+          </View>
+
+          <View style={styles.center}>
+            <View
+              style={[
+                styles.scanFrame,
+                { width: scanBox.w, height: scanBox.h },
+              ]}
+            >
+              <View style={styles.cornerTL} />
+              <View style={styles.cornerTR} />
+              <View style={styles.cornerBL} />
+              <View style={styles.cornerBR} />
+
+              <Animated.View
+                pointerEvents="none"
+                style={[
+                  styles.scanLine,
+                  {
+                    width: scanBox.w - 28,
+                    transform: [
+                      {
+                        translateY: scanAnim.interpolate({
+                          inputRange: [0, 1],
+                          outputRange: [14, scanBox.h - 20],
+                        }),
+                      },
+                    ],
+                    opacity: scanState === 'scanning' ? 1 : 0,
+                  },
+                ]}
+              />
+
+              <View style={styles.frameGlow} />
+            </View>
+
+            <View style={styles.hintWrap}>
+              <Text style={styles.hintTitle}>
+                {scanState === 'connecting'
+                  ? 'Connecting…'
+                  : scanState === 'scanning'
+                  ? 'Scanning…'
+                  : 'Ready to scan'}
+              </Text>
+              <Text style={styles.hintBody}>
+                Keep your face centered. Remove mask/cap for best results.
+              </Text>
+            </View>
+          </View>
+
+          <View style={styles.bottom}>
+            <TouchableOpacity
+              style={[
+                styles.primaryBtn,
+                (scanState === 'connecting' || scanState === 'scanning') &&
+                  styles.btnDisabled,
+              ]}
+              onPress={startScan}
+              disabled={scanState === 'connecting' || scanState === 'scanning'}
+              activeOpacity={0.9}
+            >
+              {scanState === 'connecting' ? (
+                <View style={styles.btnRow}>
+                  <ActivityIndicator color="#00130A" />
+                  <Text style={styles.primaryBtnText}>Starting…</Text>
+                </View>
+              ) : scanState === 'scanning' ? (
+                <Text style={styles.primaryBtnText}>Scanning…</Text>
+              ) : (
+                <Text style={styles.primaryBtnText}>Mark Attendance</Text>
+              )}
+            </TouchableOpacity>
+
+            {(scanState === 'connecting' || scanState === 'scanning') && (
+              <TouchableOpacity
+                style={styles.secondaryBtn}
+                onPress={stopScan}
+                activeOpacity={0.85}
+              >
+                <Text style={styles.secondaryBtnText}>Cancel</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        </SafeAreaView>
+      </View>
+    );
+  };
+
+  const renderCheckAttendance = () => {
+    const renderRow = ({ item }: { item: AttendanceRow }) => (
+      <View style={styles.tableRow}>
+        <Text style={[styles.tableCell, styles.cellDate]}>{item.date}</Text>
+        <Text style={styles.tableCell}>{item.punchInTime}</Text>
+        <Text style={styles.tableCell}>{item.punchOutTime}</Text>
+        <Text style={styles.tableCell}>{item.ot}</Text>
+        <Text
+          style={[
+            styles.tableCell,
+            item.absent ? styles.cellBad : styles.cellGood,
+          ]}
+        >
+          {item.absent ? 'Absent' : 'Present'}
+        </Text>
+      </View>
+    );
+
     return (
       <SafeAreaView style={styles.safe}>
         <StatusBar barStyle="light-content" />
         <View style={styles.bg} />
 
         <Modal
-          visible={alertVisible}
+          visible={yearPickerVisible}
           transparent
           animationType="fade"
-          onRequestClose={dismissAlert}
+          onRequestClose={() => setYearPickerVisible(false)}
         >
-          <View style={styles.alertBackdrop}>
-            <View style={styles.alertCard}>
-              <View style={styles.alertAccent} />
-              <Text style={styles.alertTitle}>{alertTitle}</Text>
-              {!!alertMessage && (
-                <Text style={styles.alertMessage}>{alertMessage}</Text>
-              )}
-
-              <View style={styles.alertBtnRow}>
-                {alertButtons.map((b, idx) => {
-                  const variant = b.variant ?? 'primary';
-                  const btnStyle =
-                    variant === 'primary'
-                      ? styles.alertBtnPrimary
-                      : variant === 'danger'
-                        ? styles.alertBtnDanger
-                        : styles.alertBtnSecondary;
-                  const textStyle =
-                    variant === 'primary'
-                      ? styles.alertBtnPrimaryText
-                      : styles.alertBtnSecondaryText;
-
-                  return (
-                    <TouchableOpacity
-                      key={`${b.text}-${idx}`}
-                      style={[styles.alertBtnBase, btnStyle]}
-                      activeOpacity={0.9}
-                      onPress={() => {
-                        dismissAlert();
-                        b.onPress?.();
-                      }}
+          <TouchableOpacity
+            style={styles.yearModalBackdrop}
+            activeOpacity={1}
+            onPress={() => setYearPickerVisible(false)}
+          >
+            <View
+              style={styles.yearModalCard}
+              onStartShouldSetResponder={() => true}
+            >
+              <Text style={styles.yearModalTitle}>Select year</Text>
+              <FlatList
+                data={YEAR_OPTIONS}
+                keyExtractor={item => item}
+                keyboardShouldPersistTaps="handled"
+                renderItem={({ item }) => (
+                  <TouchableOpacity
+                    style={[
+                      styles.yearOption,
+                      item === year && styles.yearOptionSelected,
+                    ]}
+                    onPress={() => {
+                      setYear(item);
+                      setYearPickerVisible(false);
+                    }}
+                  >
+                    <Text
+                      style={[
+                        styles.yearOptionText,
+                        item === year && styles.yearOptionTextSelected,
+                      ]}
                     >
-                      <Text style={textStyle}>{b.text}</Text>
-                    </TouchableOpacity>
-                  );
-                })}
-              </View>
+                      {item}
+                    </Text>
+                  </TouchableOpacity>
+                )}
+              />
             </View>
-          </View>
+          </TouchableOpacity>
         </Modal>
 
-        <View style={styles.page}>
-          <View style={styles.header}>
+        <View style={styles.pageWide}>
+          <View style={styles.checkHeader}>
             <Text style={styles.kicker}>ORBINGER</Text>
-            <Text style={styles.h1}>Location Verification</Text>
+            <Text style={styles.h1}>Check Attendance</Text>
             <Text style={styles.sub}>
-              Confirm you’re on-site, then continue to face scan.
+              Enter Employee ID and month. Pick the year from the list.
             </Text>
           </View>
 
           <View style={styles.card}>
-            <View style={styles.rowBetween}>
-              <View>
-                <Text style={styles.cardTitle}>Step 1</Text>
-                <Text style={styles.cardBody}>
-                  Verify GPS location within the allowed radius.
-                </Text>
+            <View style={styles.formGrid}>
+              <View style={styles.field}>
+                <Text style={styles.label}>Employee ID</Text>
+                <TextInput
+                  value={empId}
+                  onChangeText={setEmpId}
+                  placeholder="e.g. S2666"
+                  placeholderTextColor="rgba(255,255,255,0.35)"
+                  style={styles.input}
+                  keyboardType="default"
+                  autoCapitalize="characters"
+                  autoCorrect={false}
+                />
               </View>
-              <View style={styles.pill}>
-                <Text style={styles.pillText}>50m</Text>
+
+              <View style={styles.fieldRow}>
+                <View style={[styles.field, styles.fieldHalf]}>
+                  <Text style={styles.label}>Month</Text>
+                  <TextInput
+                    value={month}
+                    onChangeText={setMonth}
+                    placeholder="1-12"
+                    placeholderTextColor="rgba(255,255,255,0.35)"
+                    style={styles.input}
+                    keyboardType="number-pad"
+                  />
+                </View>
+                <View style={[styles.field, styles.fieldHalf]}>
+                  <Text style={styles.label}>Year</Text>
+                  <TouchableOpacity
+                    style={styles.yearSelect}
+                    onPress={() => setYearPickerVisible(true)}
+                    activeOpacity={0.85}
+                  >
+                    <Text style={styles.yearSelectText}>{year}</Text>
+                    <Text style={styles.yearSelectChevron}>▼</Text>
+                  </TouchableOpacity>
+                </View>
               </View>
             </View>
 
             <TouchableOpacity
-              style={[styles.primaryBtn, loading && styles.btnDisabled]}
-              onPress={checkLocation}
-              disabled={loading}
+              style={[styles.primaryBtn, checkLoading && styles.btnDisabled]}
+              onPress={searchAttendance}
+              disabled={checkLoading}
               activeOpacity={0.9}
             >
-              {loading ? (
+              {checkLoading ? (
                 <View style={styles.btnRow}>
                   <ActivityIndicator color="#00130A" />
-                  <Text style={styles.primaryBtnText}>Checking…</Text>
+                  <Text style={styles.primaryBtnText}>Searching…</Text>
                 </View>
               ) : (
-                <Text style={styles.primaryBtnText}>Check Location</Text>
+                <Text style={styles.primaryBtnText}>Search</Text>
               )}
             </TouchableOpacity>
-
-            {!!status && (
-              <View style={styles.statusWrap}>
-                <Text style={styles.statusText}>{status}</Text>
-              </View>
-            )}
           </View>
 
-          <View style={styles.footer}>
-            <Text style={styles.footerText}>
-              Tip: Enable GPS and set Location Accuracy to High for faster
-              verification.
-            </Text>
+          <View style={styles.tableCard}>
+            <View style={styles.tableHeader}>
+              <Text style={[styles.tableHeaderCell, styles.cellDate]}>
+                Day
+              </Text>
+              <Text style={styles.tableHeaderCell}>Punch In</Text>
+              <Text style={styles.tableHeaderCell}>Punch Out</Text>
+              <Text style={styles.tableHeaderCell}>OT</Text>
+              <Text style={styles.tableHeaderCell}>Status</Text>
+            </View>
+
+            <FlatList
+              data={rows}
+              keyExtractor={(item, idx) => `${item.date}-${idx}`}
+              renderItem={renderRow}
+              keyboardShouldPersistTaps="handled"
+              ListEmptyComponent={
+                <View style={styles.emptyState}>
+                  <Text style={styles.emptyTitle}>No data</Text>
+                  <Text style={styles.emptyBody}>
+                    Search to see attendance for the selected month.
+                  </Text>
+                </View>
+              }
+              contentContainerStyle={
+                rows.length === 0 ? undefined : styles.tableListContent
+              }
+            />
           </View>
         </View>
       </SafeAreaView>
     );
-  }
+  };
 
-  // ---------- ATTENDANCE SCREEN ----------
-  return (
-    <View style={styles.attendanceRoot}>
-      <StatusBar barStyle="light-content" translucent backgroundColor="transparent" />
-
-      {device && (
-        <Camera
-          ref={cameraRef}
-          style={styles.camera}
-          device={device}
-          isActive={true}
-          photo={true}
-          preview={true}
-        />
-      )}
-
-      <View style={styles.cameraTint} />
-
-      <Modal
-        visible={alertVisible}
-        transparent
-        animationType="fade"
-        onRequestClose={dismissAlert}
+  const BottomNav = () => (
+    <View style={styles.bottomNav}>
+      <TouchableOpacity
+        style={[styles.navItem, tab === 'mark' && styles.navItemActive]}
+        onPress={() => {
+          setTab('mark');
+        }}
+        activeOpacity={0.85}
       >
-        <View style={styles.alertBackdrop}>
-          <View style={styles.alertCard}>
-            <View style={styles.alertAccent} />
-            <Text style={styles.alertTitle}>{alertTitle}</Text>
-            {!!alertMessage && (
-              <Text style={styles.alertMessage}>{alertMessage}</Text>
-            )}
+        <Text style={[styles.navText, tab === 'mark' && styles.navTextActive]}>
+          Mark Attendance
+        </Text>
+      </TouchableOpacity>
+      <TouchableOpacity
+        style={[styles.navItem, tab === 'check' && styles.navItemActive]}
+        onPress={() => {
+          stopScan();
+          setScreen('location');
+          setTab('check');
+        }}
+        activeOpacity={0.85}
+      >
+        <Text style={[styles.navText, tab === 'check' && styles.navTextActive]}>
+          Check Attendance
+        </Text>
+      </TouchableOpacity>
+    </View>
+  );
 
-            <View style={styles.alertBtnRow}>
-              {alertButtons.map((b, idx) => {
-                const variant = b.variant ?? 'primary';
-                const btnStyle =
-                  variant === 'primary'
-                    ? styles.alertBtnPrimary
-                    : variant === 'danger'
-                      ? styles.alertBtnDanger
-                      : styles.alertBtnSecondary;
-                const textStyle =
-                  variant === 'primary'
-                    ? styles.alertBtnPrimaryText
-                    : styles.alertBtnSecondaryText;
+  return (
+    <View style={styles.root}>
+      {renderAlertModal()}
 
-                return (
-                  <TouchableOpacity
-                    key={`${b.text}-${idx}`}
-                    style={[styles.alertBtnBase, btnStyle]}
-                    activeOpacity={0.9}
-                    onPress={() => {
-                      dismissAlert();
-                      b.onPress?.();
-                    }}
-                  >
-                    <Text style={textStyle}>{b.text}</Text>
-                  </TouchableOpacity>
-                );
-              })}
-            </View>
-          </View>
-        </View>
-      </Modal>
+      <View style={styles.content}>
+        {tab === 'mark' ? <MarkAttendanceTab /> : renderCheckAttendance()}
+      </View>
 
-      <SafeAreaView style={styles.attendanceSafe}>
-        <View style={styles.topBar}>
-          <TouchableOpacity
-            style={styles.iconBtn}
-            onPress={() => {
-              stopScan();
-              setScreen('location');
-            }}
-            activeOpacity={0.8}
-          >
-            <Text style={styles.iconBtnText}>Back</Text>
-          </TouchableOpacity>
-
-          <View>
-            <Text style={styles.topTitle}>Face Scan</Text>
-            <Text style={styles.topSubtitle}>
-              Align your face inside the frame
-            </Text>
-          </View>
-
-          <View style={styles.iconBtnGhost} />
-        </View>
-
-        <View style={styles.center}>
-          <View
-            style={[
-              styles.scanFrame,
-              { width: scanBox.w, height: scanBox.h },
-            ]}
-          >
-            <View style={styles.cornerTL} />
-            <View style={styles.cornerTR} />
-            <View style={styles.cornerBL} />
-            <View style={styles.cornerBR} />
-
-            <Animated.View
-              pointerEvents="none"
-              style={[
-                styles.scanLine,
-                {
-                  width: scanBox.w - 28,
-                  transform: [
-                    {
-                      translateY: scanAnim.interpolate({
-                        inputRange: [0, 1],
-                        outputRange: [14, scanBox.h - 20],
-                      }),
-                    },
-                  ],
-                  opacity: scanState === 'scanning' ? 1 : 0,
-                },
-              ]}
-            />
-
-            <View style={styles.frameGlow} />
-          </View>
-
-          <View style={styles.hintWrap}>
-            <Text style={styles.hintTitle}>
-              {scanState === 'connecting'
-                ? 'Connecting…'
-                : scanState === 'scanning'
-                  ? 'Scanning…'
-                  : 'Ready to scan'}
-            </Text>
-            <Text style={styles.hintBody}>
-              Keep your face centered. Remove mask/cap for best results.
-            </Text>
-          </View>
-        </View>
-
-        <View style={styles.bottom}>
-          <TouchableOpacity
-            style={[
-              styles.primaryBtn,
-              (scanState === 'connecting' || scanState === 'scanning') &&
-                styles.btnDisabled,
-            ]}
-            onPress={startScan}
-            disabled={scanState === 'connecting' || scanState === 'scanning'}
-            activeOpacity={0.9}
-          >
-            {scanState === 'connecting' ? (
-              <View style={styles.btnRow}>
-                <ActivityIndicator color="#00130A" />
-                <Text style={styles.primaryBtnText}>Starting…</Text>
-              </View>
-            ) : scanState === 'scanning' ? (
-              <Text style={styles.primaryBtnText}>Scanning…</Text>
-            ) : (
-              <Text style={styles.primaryBtnText}>Mark Attendance</Text>
-            )}
-          </TouchableOpacity>
-
-          {(scanState === 'connecting' || scanState === 'scanning') && (
-            <TouchableOpacity
-              style={styles.secondaryBtn}
-              onPress={stopScan}
-              activeOpacity={0.85}
-            >
-              <Text style={styles.secondaryBtnText}>Cancel</Text>
-            </TouchableOpacity>
-          )}
-        </View>
-      </SafeAreaView>
+      <BottomNav />
     </View>
   );
 }
 
 // ================= STYLES =================
 const styles = StyleSheet.create({
+  root: { flex: 1, backgroundColor: BG },
+  content: { flex: 1 },
   safe: { flex: 1, backgroundColor: BG },
   bg: {
     ...StyleSheet.absoluteFillObject,
@@ -757,6 +1162,148 @@ const styles = StyleSheet.create({
     lineHeight: 18,
   },
 
+  pageWide: {
+    flex: 1,
+    paddingHorizontal: 16,
+    paddingTop: 18,
+    paddingBottom: 18,
+    alignSelf: 'center',
+    width: '100%',
+    maxWidth: Math.max(CARD_MAX_W, 520),
+  },
+  checkHeader: { marginTop: 6, marginBottom: 10 },
+  formGrid: { gap: 12 },
+  field: { gap: 8 },
+  fieldRow: { flexDirection: 'row', gap: 12 },
+  fieldHalf: { flex: 1 },
+  label: {
+    color: 'rgba(255,255,255,0.65)',
+    fontSize: 12.5,
+    fontWeight: '800',
+    letterSpacing: 0.3,
+  },
+  input: {
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.10)',
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: Platform.OS === 'android' ? 10 : 12,
+    color: '#fff',
+    fontSize: 14.5,
+  },
+  yearSelect: {
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.10)',
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: Platform.OS === 'android' ? 10 : 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  yearSelectText: {
+    color: '#fff',
+    fontSize: 14.5,
+    fontWeight: '700',
+  },
+  yearSelectChevron: {
+    color: 'rgba(255,255,255,0.45)',
+    fontSize: 10,
+    marginLeft: 8,
+  },
+  yearModalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.62)',
+    justifyContent: 'center',
+    padding: 24,
+  },
+  yearModalCard: {
+    backgroundColor: BG_2,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.10)',
+    maxHeight: 360,
+    paddingVertical: 12,
+    paddingHorizontal: 8,
+  },
+  yearModalTitle: {
+    color: '#fff',
+    fontWeight: '900',
+    fontSize: 16,
+    textAlign: 'center',
+    marginBottom: 8,
+    paddingHorizontal: 8,
+  },
+  yearOption: {
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+  },
+  yearOptionSelected: {
+    backgroundColor: 'rgba(46,242,161,0.14)',
+  },
+  yearOptionText: {
+    color: 'rgba(255,255,255,0.85)',
+    fontSize: 15,
+    fontWeight: '700',
+    textAlign: 'center',
+  },
+  yearOptionTextSelected: {
+    color: ACCENT,
+  },
+
+  tableCard: {
+    marginTop: 14,
+    backgroundColor: BG_2,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.08)',
+    overflow: 'hidden',
+    flex: 1,
+  },
+  tableHeader: {
+    flexDirection: 'row',
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.08)',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+  },
+  tableHeaderCell: {
+    flex: 1,
+    color: 'rgba(255,255,255,0.72)',
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  tableRow: {
+    flexDirection: 'row',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255,255,255,0.06)',
+  },
+  tableCell: {
+    flex: 1,
+    color: 'rgba(255,255,255,0.86)',
+    fontSize: 12.5,
+    fontWeight: '700',
+  },
+  cellDate: { flex: 1.25 },
+  cellGood: { color: 'rgba(46,242,161,0.95)' },
+  cellBad: { color: 'rgba(255,77,94,0.95)' },
+  emptyState: { padding: 18, alignItems: 'center' },
+  emptyTitle: { color: '#fff', fontWeight: '900', fontSize: 14.5 },
+  emptyBody: {
+    marginTop: 6,
+    color: 'rgba(255,255,255,0.62)',
+    fontSize: 12.5,
+    textAlign: 'center',
+    lineHeight: 18,
+  },
+  tableListContent: { paddingBottom: 10 },
+
   attendanceRoot: { flex: 1, backgroundColor: BG },
   camera: {
     ...StyleSheet.absoluteFillObject,
@@ -789,7 +1336,12 @@ const styles = StyleSheet.create({
   },
   iconBtnGhost: { minWidth: 70 },
   iconBtnText: { color: '#fff', fontWeight: '800', fontSize: 13.5 },
-  topTitle: { color: '#fff', fontWeight: '900', fontSize: 18, textAlign: 'center' },
+  topTitle: {
+    color: '#fff',
+    fontWeight: '900',
+    fontSize: 18,
+    textAlign: 'center',
+  },
   topSubtitle: {
     marginTop: 2,
     color: 'rgba(255,255,255,0.70)',
@@ -882,7 +1434,12 @@ const styles = StyleSheet.create({
     width: '100%',
     maxWidth: Math.min(CARD_MAX_W, SCREEN_W - 32),
   },
-  hintTitle: { color: '#fff', fontWeight: '900', fontSize: 14.5, textAlign: 'center' },
+  hintTitle: {
+    color: '#fff',
+    fontWeight: '900',
+    fontSize: 14.5,
+    textAlign: 'center',
+  },
   hintBody: {
     marginTop: 4,
     color: 'rgba(255,255,255,0.70)',
@@ -906,6 +1463,37 @@ const styles = StyleSheet.create({
     borderColor: 'rgba(255,255,255,0.12)',
   },
   secondaryBtnText: { color: '#fff', fontWeight: '900', fontSize: 14.5 },
+
+  bottomNav: {
+    flexDirection: 'row',
+    paddingHorizontal: 14,
+    paddingTop: 10,
+    paddingBottom: Platform.OS === 'ios' ? 18 : 12,
+    backgroundColor: 'rgba(11,16,32,0.96)',
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.10)',
+    gap: 10,
+  },
+  navItem: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.10)',
+  },
+  navItemActive: {
+    backgroundColor: 'rgba(46,242,161,0.14)',
+    borderColor: 'rgba(46,242,161,0.30)',
+  },
+  navText: {
+    color: 'rgba(255,255,255,0.70)',
+    fontWeight: '900',
+    fontSize: 12.5,
+  },
+  navTextActive: { color: '#fff' },
 
   alertBackdrop: {
     flex: 1,
